@@ -3,13 +3,15 @@ easyocr
 chromadb 
 langchain 
 face_recognition 
-dlib insightface 
+dlib 
+insightface 
 onnxruntime 
 videodb 
 groq 
 langchain_huggingface 
 langchain_community 
-easyocr weaviate-client 
+easyocr 
+weaviate-client 
 sentence-transformers 
 deep_sort_realtime 
 scikit-learn
