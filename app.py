@@ -38,6 +38,8 @@ os.makedirs(FRAMES_DIR, exist_ok=True)
 # ================= GLOBAL MODELS =================
 print("⏳ Loading AI Models...")
 yolo_model = YOLO("yolov8n.pt")
+# InsightFace on CPU prevents CUDA crashes but is slow -> blocking issue.
+# We will run this in a thread to fix the timeout.
 face_app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
 face_app.prepare(ctx_id=0, det_size=(640, 640))
 ocr_reader = easyocr.Reader(['en'], gpu=True)
@@ -118,7 +120,69 @@ def add_video_to_library(video_name):
         })
     client.close()
 
-# ================= VIDEO PROCESSING HELPERS =================
+# ================= ANALYTICS LOGIC (SYNCHRONOUS) =================
+# This function does the heavy lifting. We will call it in a thread.
+def analyze_frame_sync(frame, ts_s, tracker):
+    # 1. YOLO Detection
+    results = yolo_model(frame, verbose=False)
+    dets = []
+    for r in results[0].boxes:
+        x1, y1, x2, y2 = map(float, r.xyxy[0])
+        dets.append(([x1, y1, x2, y2], float(r.conf[0]), int(r.cls[0])))
+    
+    # 2. Tracking
+    tracks = tracker.update_tracks(dets, frame=frame)
+    frame_dets = []
+    
+    for t in tracks:
+        if not t.is_confirmed(): continue
+        tid = t.track_id
+        gid = f"G{tid}"
+        cls_id = getattr(t, "det_class", -1)
+        cls_name = yolo_model.names.get(cls_id, "Unknown")
+        
+        ltrb = t.to_ltrb()
+        x1, y1, x2, y2 = map(int, ltrb)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+        
+        # Crop logic
+        if (x2-x1) < 30 or (y2-y1) < 30: continue
+        crop = frame[y1:y2, x1:x2]
+        
+        # Color & Identity placeholders
+        color = get_dominant_color(crop)
+        plate_text = None
+        face_emb = None
+        
+        # Identity (Face)
+        if cls_name == 'person':
+            faces = face_app.get(crop)
+            if faces:
+                face_emb = faces[0].embedding
+        
+        # Plate (Vehicle)
+        elif cls_id in [2, 3, 5, 7]:
+            try:
+                ocr = ocr_reader.readtext(crop)
+                for _, txt, conf in ocr:
+                    clean = "".join(e for e in txt if e.isalnum()).upper()
+                    if conf > OCR_CONFIDENCE and len(clean) > 3:
+                        plate_text = clean
+                        break
+            except: pass
+
+        frame_dets.append({
+            "class_name": cls_name,
+            "global_id": gid,
+            "bbox_center": ((x1+x2)//2, (y1+y2)//2),
+            "license_plate": plate_text,
+            "color": color,
+            "face_emb": face_emb
+        })
+        
+    return frame_dets
+
 def get_dominant_color(image, k=1):
     if image.size == 0: return "Unknown"
     try:
@@ -177,6 +241,8 @@ async def process_video_pipeline(video_path, status_msg):
     sample_step = max(1, int(round(fps / SAMPLE_FPS)))
     
     tracker = DeepSort(max_age=30, n_init=3, nn_budget=100)
+    
+    # State Memory
     frames_meta = []
     known_embs = []
     known_names = []
@@ -190,99 +256,69 @@ async def process_video_pipeline(video_path, status_msg):
         ret, frame = cap.read()
         if not ret: break
         
-        # --- CRITICAL FIX: Prevent Timeouts ---
-        # Yield control to the event loop every 5 frames to keep the connection alive
-        if frame_idx % 5 == 0:
-            await asyncio.sleep(0)
+        # --- CRITICAL FIX: Explicit yield ---
+        await asyncio.sleep(0)
 
         if frame_idx % sample_step == 0:
-            # Update UI regularly (Reduced frequency to prevent packet overflow)
-            if len(frames_meta) % 10 == 0:
+            if len(frames_meta) % 5 == 0:
                 perc = int((frame_idx / total_frames) * 100)
                 status_msg.content = f"⚙️ **Processing Video...**\nAnalysis: {perc}% Complete"
                 await status_msg.update()
 
             ts_s = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-            results = yolo_model(frame, verbose=False)
-            dets = []
-            for r in results[0].boxes:
-                x1, y1, x2, y2 = map(float, r.xyxy[0])
-                dets.append(([x1, y1, x2, y2], float(r.conf[0]), int(r.cls[0])))
             
-            tracks = tracker.update_tracks(dets, frame=frame)
-            frame_dets = []
+            # --- CRITICAL FIX: Run Heavy AI in Thread ---
+            # This prevents the websocket from timing out during face/yolo inference
+            frame_results = await cl.make_async(analyze_frame_sync)(frame, ts_s, tracker)
             
-            for t in tracks:
-                if not t.is_confirmed(): continue
-                tid = t.track_id
-                gid = f"G{tid}"
-                cls_id = getattr(t, "det_class", -1)
-                cls_name = yolo_model.names.get(cls_id, "Unknown")
+            # Process results (lightweight logic)
+            processed_dets = []
+            for d in frame_results:
+                gid = d['global_id']
+                final_name = d['class_name']
                 
-                ltrb = t.to_ltrb()
-                x1, y1, x2, y2 = map(int, ltrb)
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-                
-                final_name = cls_name
-                plate_text = None
-                color = "Unknown"
+                # Update Velocity
+                center = d['bbox_center']
+                prev_c, prev_t = track_velocity.get(gid, (None, None))
                 move = "Unknown"
+                if prev_c: move = get_movement_status(center, prev_c, ts_s - prev_t)
+                track_velocity[gid] = (center, ts_s)
                 
-                if (x2-x1) > 30 and (y2-y1) > 30:
-                    crop = frame[y1:y2, x1:x2]
+                # Update Identity (Face)
+                if d['face_emb'] is not None:
+                    emb = d['face_emb']
+                    best_score = -1
+                    best_idx = -1
+                    for idx, saved_emb in enumerate(known_embs):
+                        score = np.dot(emb, saved_emb) / (np.linalg.norm(emb) * np.linalg.norm(saved_emb))
+                        if score > best_score: best_score, best_idx = score, idx
                     
-                    # Only run heavy analytics occasionally to speed up
-                    color = get_dominant_color(crop)
-                    
-                    center = ((x1+x2)//2, (y1+y2)//2)
-                    prev_c, prev_t = track_velocity.get(gid, (None, None))
-                    if prev_c: move = get_movement_status(center, prev_c, ts_s - prev_t)
-                    track_velocity[gid] = (center, ts_s)
-                    
-                    if cls_name == 'person':
-                        if gid in track_identities:
-                            final_name = track_identities[gid]
-                        else:
-                            faces = face_app.get(crop)
-                            if faces:
-                                emb = faces[0].embedding
-                                best_score = -1
-                                best_idx = -1
-                                for idx, saved_emb in enumerate(known_embs):
-                                    score = np.dot(emb, saved_emb) / (np.linalg.norm(emb) * np.linalg.norm(saved_emb))
-                                    if score > best_score: best_score, best_idx = score, idx
-                                
-                                if best_score > FACE_MATCH_THRESHOLD:
-                                    final_name = known_names[best_idx]
-                                else:
-                                    final_name = f"Person {next_pid}"
-                                    known_embs.append(emb)
-                                    known_names.append(final_name)
-                                    next_pid += 1
-                                track_identities[gid] = final_name
-                    elif cls_id in [2, 3, 5, 7]:
-                        if gid in track_plates:
-                            plate_text = track_plates[gid]
-                        else:
-                            try:
-                                ocr = ocr_reader.readtext(crop)
-                                for _, txt, conf in ocr:
-                                    clean = "".join(e for e in txt if e.isalnum()).upper()
-                                    if conf > OCR_CONFIDENCE and len(clean) > 3:
-                                        plate_text = clean
-                                        track_plates[gid] = clean
-                                        break
-                            except: pass
+                    if best_score > FACE_MATCH_THRESHOLD:
+                        final_name = known_names[best_idx]
+                    else:
+                        final_name = f"Person {next_pid}"
+                        known_embs.append(emb)
+                        known_names.append(final_name)
+                        next_pid += 1
+                    track_identities[gid] = final_name
+                elif gid in track_identities:
+                    final_name = track_identities[gid]
+                
+                # Update Plate
+                plate = d['license_plate']
+                if plate:
+                    track_plates[gid] = plate
+                elif gid in track_plates:
+                    plate = track_plates[gid]
 
-                frame_dets.append({
+                processed_dets.append({
                     "class_name": final_name,
                     "global_id": gid,
-                    "license_plate": plate_text,
-                    "color": color,
+                    "license_plate": plate,
+                    "color": d['color'],
                     "movement": move
                 })
-            
+
             scene_text = ""
             for s in scenes_data:
                 if s["start"] <= ts_s < s["end"]:
@@ -292,7 +328,7 @@ async def process_video_pipeline(video_path, status_msg):
             frames_meta.append({
                 "timestamp_s": ts_s,
                 "scene_text": scene_text,
-                "detections": frame_dets
+                "detections": processed_dets
             })
             
         frame_idx += 1
@@ -384,35 +420,47 @@ async def start():
     
     video_name = None
     
-    if res.get("name") == "upload_new":
-        files = None
-        while files == None:
-            files = await cl.AskFileMessage(
-                content="Please upload a surveillance video (MP4/MOV).",
-                accept=["video/mp4", "video/mov"],
-                max_size_mb=100, timeout=180
-            ).send()
-        
-        file = files[0]
-        video_name = file.name
-        
-        video_path = f"input_{file.name}"
-        with open(video_path, "wb") as f:
-            with open(file.path, "rb") as source:
-                shutil.copyfileobj(source, f)
-        
-        msg = cl.Message(content="⚙️ **Starting Video Pipeline...**")
-        await msg.send()
-        
-        json_data = await process_video_pipeline(video_path, msg)
-        await upload_to_weaviate(json_data, video_name, msg)
-        
-    else:
-        video_name = res.get("value")
-        await cl.Message(content=f"📂 **Loaded:** `{video_name}`\nData retrieved from Knowledge Base.").send()
+    if res:
+        try:
+            action_name = res.name
+            action_value = res.value
+        except AttributeError:
+            action_name = res.get("name")
+            action_value = res.get("value")
+
+        if action_name == "upload_new":
+            files = None
+            while files == None:
+                files = await cl.AskFileMessage(
+                    content="Please upload a surveillance video (MP4/MOV).",
+                    accept=["video/mp4", "video/mov"],
+                    max_size_mb=100, timeout=180
+                ).send()
+            
+            file = files[0]
+            video_name = file.name
+            
+            video_path = f"input_{file.name}"
+            with open(video_path, "wb") as f:
+                with open(file.path, "rb") as source:
+                    shutil.copyfileobj(source, f)
+            
+            msg = cl.Message(content="⚙️ **Starting Video Pipeline...**")
+            await msg.send()
+            
+            json_data = await process_video_pipeline(video_path, msg)
+            await upload_to_weaviate(json_data, video_name, msg)
+            
+        else:
+            video_name = action_value
+            await cl.Message(content=f"📂 **Loaded:** `{video_name}`\nData retrieved from Knowledge Base.").send()
 
     cl.user_session.set("video_name", video_name)
-    await cl.Message(content=f"✅ **Ready!** You are chatting about `{video_name}`.\nAsk questions like *'Who entered at 00:02?'* or *'Did a red car pass by?'*").send()
+    
+    if video_name:
+        await cl.Message(content=f"✅ **Ready!** You are chatting about `{video_name}`.\nAsk questions like *'Who entered at 00:02?'* or *'Did a red car pass by?'*").send()
+    else:
+        await cl.Message(content="❌ No video selected. Please reload.").send()
 
 @cl.on_message
 async def main(message: cl.Message):
